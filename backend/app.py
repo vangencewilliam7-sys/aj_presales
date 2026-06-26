@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 from supabase import create_client, Client
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Form
+from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -445,6 +445,38 @@ async def ingest_documents_endpoint(
     except Exception as e:
         logger.error(f"Ingest error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/journalist/visual-input/analyze")
+async def visual_input_analyze(
+    session_id: str = Form(...),
+    user_id: str = Form(""),
+    context_text: str = Form(""),
+    input_type: str = Form("image"),
+    file: UploadFile = File(...)
+):
+    """Analyze uploaded visual input (image or screen recording)."""
+    allowed_types = ["image/png", "image/jpeg", "image/webp", "video/webm", "video/mp4", "video/quicktime"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type. Must be PNG, JPG, WEBP, WEBM, MP4, or MOV.")
+        
+    # Read file bytes
+    file_bytes = await file.read()
+    file_size = len(file_bytes)
+    
+    # 250MB limit for video/image
+    if file_size > 250 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 250MB.")
+
+    return await interview_domain.visual_analyze(
+        session_id=session_id,
+        user_id=user_id,
+        input_type=input_type,
+        file_bytes=file_bytes,
+        mime_type=file.content_type,
+        file_name=file.filename,
+        file_size=file_size,
+        context_text=context_text
+    )
 
 if __name__ == "__main__":
     import uvicorn

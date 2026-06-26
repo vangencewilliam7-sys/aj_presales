@@ -1,12 +1,14 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Mic, MicOff, Send, HelpCircle, StopCircle, PauseCircle, Loader2, BrainCircuit, Eye, Target, Zap, FileText, ArrowRight } from 'lucide-react';
+import { Mic, MicOff, Send, HelpCircle, StopCircle, PauseCircle, Loader2, BrainCircuit, Eye, Target, Zap, FileText, ArrowRight, Image as ImageIcon, X, Monitor, Film } from 'lucide-react';
 
 interface Message {
   id: string;
   role: 'expert' | 'ai';
   text: string;
   timestamp: number;
+  imageUrl?: string;
+  videoUrl?: string;
   decision?: {
     intent_classification: string;
     internal_reasoning: string;
@@ -24,6 +26,24 @@ const InterviewPage: React.FC = () => {
   const [isSynthesizing, setIsSynthesizing] = useState(false);
   const [showDecision, setShowDecision] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
+  const videoFileInputRef = useRef<HTMLInputElement>(null);
+
+  const [isScreenRecording, setIsScreenRecording] = useState(false);
+  const [screenRecordingTimer, setScreenRecordingTimer] = useState(0);
+  const [videoPreview, setVideoPreview] = useState<string | null>(null);
+  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [isAnalyzingVideo, setIsAnalyzingVideo] = useState(false);
+  
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const timerIntervalRef = useRef<number | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
 
   const [showScriptSidebar, setShowScriptSidebar] = useState(true);
   const [scriptThemes, setScriptThemes] = useState<any[]>([]);
@@ -81,8 +101,184 @@ const InterviewPage: React.FC = () => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages]);
 
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setSelectedImage(file);
+      const reader = new FileReader();
+      reader.onload = (e) => setImagePreview(e.target?.result as string);
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const clearImage = () => {
+    setSelectedImage(null);
+    setImagePreview(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleVideoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      setSelectedVideo(file);
+      setVideoPreview(URL.createObjectURL(file));
+    }
+  };
+
+  const clearVideo = () => {
+    setRecordedBlob(null);
+    setSelectedVideo(null);
+    setVideoPreview(null);
+    if (videoFileInputRef.current) videoFileInputRef.current.value = '';
+  };
+
+  const startScreenRecording = async () => {
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      const tracks = [...screenStream.getTracks(), ...micStream.getTracks()];
+      const combinedStream = new MediaStream(tracks);
+      streamRef.current = combinedStream;
+      
+      // Try webm, fallback to mp4
+      const mimeType = MediaRecorder.isTypeSupported('video/webm') ? 'video/webm' : 'video/mp4';
+      const recorder = new MediaRecorder(combinedStream, { 
+        mimeType,
+        videoBitsPerSecond: 250000 // Compress to 250 kbps to keep file size low
+      });
+      mediaRecorderRef.current = recorder;
+      recordedChunksRef.current = [];
+      
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+      
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+        setRecordedBlob(blob);
+        setVideoPreview(URL.createObjectURL(blob));
+        tracks.forEach(t => t.stop());
+      };
+      
+      recorder.start(1000);
+      setIsScreenRecording(true);
+      setScreenRecordingTimer(0);
+      timerIntervalRef.current = window.setInterval(() => {
+        setScreenRecordingTimer(prev => prev + 1);
+      }, 1000);
+      
+    } catch (err) {
+      console.error(err);
+      alert("Screen sharing or microphone permission was denied.");
+    }
+  };
+
+  const stopScreenRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    }
+    setIsScreenRecording(false);
+  };
+
   const handleSend = async (text: string) => {
-    if (!text.trim() || !sessionId) return;
+    if ((!text.trim() && !selectedImage && !recordedBlob && !selectedVideo) || !sessionId) return;
+    
+    if (recordedBlob || selectedVideo) {
+      const currentPreview = videoPreview;
+      const isUploaded = !!selectedVideo;
+      const videoSource = isUploaded ? selectedVideo : recordedBlob;
+      const inputType = isUploaded ? "video" : "screen_recording";
+      const fileExt = isUploaded ? selectedVideo.name.split('.').pop() : (recordedBlob.type.includes("webm") ? "webm" : "mp4");
+      const filename = isUploaded ? selectedVideo.name : `recording_${Date.now()}.${fileExt}`;
+      
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'expert', text: `[${isUploaded ? 'Uploaded Video' : 'Screen Recording'}] ${text}`, timestamp: Date.now(), videoUrl: currentPreview || undefined }]);
+      setIsAnalyzingVideo(true);
+      
+      const formData = new FormData();
+      formData.append("session_id", sessionId);
+      formData.append("context_text", text);
+      formData.append("input_type", inputType);
+      formData.append("file", videoSource, filename);
+      
+      clearVideo();
+      setInputText('');
+
+      try {
+        const res = await fetch('http://localhost:9120/api/journalist/visual-input/analyze', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        
+        if (!res.ok) {
+           throw new Error(data.message || data.detail || "Analysis failed");
+        }
+        
+        setMessages(prev => [...prev, {
+          id: (Date.now() + 1).toString(),
+          role: 'ai',
+          text: data.first_follow_up_question || "Interesting recording. Could you elaborate on what we just saw?",
+          timestamp: Date.now(),
+          decision: {
+            intent_classification: 'video_analysis',
+            internal_reasoning: data.short_summary || 'Analyzed screen recording',
+            action: 'video_follow_up'
+          }
+        }]);
+      } catch (err: any) {
+        console.error(err);
+        alert(err.message || "Failed to analyze video.");
+      } finally {
+        setIsAnalyzingVideo(false);
+      }
+      return;
+    }
+    
+    if (selectedImage) {
+      const currentPreview = imagePreview;
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'expert', text: `[Uploaded Image: ${selectedImage.name}] ${text}`, timestamp: Date.now(), imageUrl: currentPreview || undefined }]);
+      setIsLoading(true);
+      const formData = new FormData();
+      formData.append("session_id", sessionId);
+      formData.append("context_text", text);
+      formData.append("input_type", "image");
+      formData.append("file", selectedImage);
+      
+      clearImage();
+      setInputText('');
+
+      try {
+        const res = await fetch('http://localhost:9120/api/journalist/visual-input/analyze', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        
+        setMessages(prev => [...prev, {
+          id: (Date.now() + 1).toString(),
+          role: 'ai',
+          text: data.first_follow_up_question || "Interesting. Can you tell me more about what we're looking at?",
+          timestamp: Date.now(),
+          decision: {
+            intent_classification: 'visual_analysis',
+            internal_reasoning: data.short_summary || 'Analyzed uploaded image',
+            action: 'visual_follow_up'
+          }
+        }]);
+      } catch (err) {
+        console.error(err);
+        alert("Failed to analyze image.");
+      } finally {
+        setIsLoading(false);
+      }
+      return;
+    }
+
     setMessages(prev => [...prev, { id: Date.now().toString(), role: 'expert', text, timestamp: Date.now() }]);
     setInputText('');
     setIsLoading(true);
@@ -206,6 +402,16 @@ const InterviewPage: React.FC = () => {
               )}
             </div>
             <div className="msg-bubble">
+              {m.videoUrl && (
+                <div style={{ marginBottom: '8px' }}>
+                  <video src={m.videoUrl} controls style={{ maxWidth: '100%', maxHeight: '250px', borderRadius: '8px', border: '1px solid var(--border)' }} />
+                </div>
+              )}
+              {m.imageUrl && (
+                <div style={{ marginBottom: '8px' }}>
+                  <img src={m.imageUrl} alt="Uploaded preview" style={{ maxWidth: '100%', maxHeight: '250px', borderRadius: '8px', border: '1px solid var(--border)' }} />
+                </div>
+              )}
               <div className="msg-text">{m.text}</div>
             </div>
             {m.role === 'ai' && m.decision && showDecision === m.id && (
@@ -242,10 +448,74 @@ const InterviewPage: React.FC = () => {
             </div>
           </div>
         )}
+        {isAnalyzingVideo && (
+          <div className="msg msg-ai">
+            <div className="typing-indicator">
+              <div className="typing-dots">
+                <div className="typing-dot" /><div className="typing-dot" /><div className="typing-dot" />
+              </div>
+              <span className="typing-text">Understanding your recording...</span>
+            </div>
+          </div>
+        )}
       </div>
 
-      <div className="chat-input-bar">
+      <div className="chat-input-bar" style={{ flexDirection: 'column', alignItems: 'center' }}>
+        {videoPreview && (
+          <div style={{ position: 'relative', width: 'fit-content', marginBottom: '10px', alignSelf: 'flex-start', marginLeft: '12%' }}>
+            <video src={videoPreview} controls style={{ maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border)' }} />
+            <button onClick={clearVideo} style={{ position: 'absolute', top: '-8px', right: '-8px', background: 'var(--red)', color: 'white', border: 'none', borderRadius: '50%', width: '20px', height: '20px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><X size={12} /></button>
+          </div>
+        )}
+        {imagePreview && (
+          <div style={{ position: 'relative', width: 'fit-content', marginBottom: '10px', alignSelf: 'flex-start', marginLeft: '12%' }}>
+            <img src={imagePreview} alt="Preview" style={{ maxHeight: '100px', borderRadius: '8px', border: '1px solid var(--border)' }} />
+            <button onClick={clearImage} style={{ position: 'absolute', top: '-8px', right: '-8px', background: 'var(--red)', color: 'white', border: 'none', borderRadius: '50%', width: '20px', height: '20px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><X size={12} /></button>
+          </div>
+        )}
+        {isScreenRecording && (
+          <div style={{ marginBottom: '10px', color: 'var(--red)', fontWeight: 'bold', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <div className="typing-dot" style={{ background: 'var(--red)', animation: 'pulse 1s infinite' }} />
+            Recording Screen & Mic: {Math.floor(screenRecordingTimer / 60).toString().padStart(2, '0')}:{(screenRecordingTimer % 60).toString().padStart(2, '0')}
+          </div>
+        )}
         <div className="chat-input-wrapper">
+          <input 
+            type="file" 
+            accept="image/png, image/jpeg, image/webp" 
+            ref={fileInputRef} 
+            onChange={handleImageSelect} 
+            style={{ display: 'none' }} 
+          />
+          <input 
+            type="file" 
+            accept="video/mp4, video/webm, video/quicktime" 
+            ref={videoFileInputRef} 
+            onChange={handleVideoSelect} 
+            style={{ display: 'none' }} 
+          />
+          <button 
+            className="mic-btn"
+            onClick={() => fileInputRef.current?.click()}
+            title="Upload Image"
+          >
+            <ImageIcon size={20} />
+          </button>
+          <button 
+            className="mic-btn"
+            onClick={() => videoFileInputRef.current?.click()}
+            title="Upload Video"
+          >
+            <Film size={20} />
+          </button>
+          <button 
+            className={`mic-btn ${isScreenRecording ? 'recording' : ''}`}
+            onClick={isScreenRecording ? stopScreenRecording : startScreenRecording}
+            title={isScreenRecording ? "Stop Screen Recording" : "Screen Share + Explain"}
+            style={isScreenRecording ? { color: 'var(--red)' } : {}}
+          >
+            {isScreenRecording ? <StopCircle size={20} /> : <Monitor size={20} />}
+          </button>
           <button 
             className={`mic-btn ${isRecording ? 'recording' : ''}`} 
             onClick={() => setIsRecording(!isRecording)}
@@ -263,7 +533,7 @@ const InterviewPage: React.FC = () => {
             className="chat-textarea"
             rows={1}
           />
-          <button className="send-btn" onClick={() => handleSend(inputText)} disabled={isLoading || !inputText.trim()}>
+          <button className="send-btn" onClick={() => handleSend(inputText)} disabled={isLoading || isAnalyzingVideo || (!inputText.trim() && !selectedImage && !recordedBlob)}>
             <Send size={20} />
           </button>
         </div>

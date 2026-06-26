@@ -8,6 +8,8 @@ from services.rag_engine import RagEngine
 from repositories.knowledge_repo import KnowledgeRepo
 from repositories.expert_repo import ExpertRepo
 from repositories.session_repo import SessionRepo
+from repositories.visual_input_repo import VisualInputRepo
+from services.gemini_vision import GeminiVisionService
 from prompts import (
     ARCHETYPE_RULES,
     get_base_persona,
@@ -32,6 +34,8 @@ class InterviewDomain(BaseDomain):
         self.expert_repo = ExpertRepo(supabase)
         self.session_repo = SessionRepo(supabase)
         self.knowledge_repo = KnowledgeRepo(supabase)
+        self.visual_input_repo = VisualInputRepo(supabase)
+        self.gemini_vision = GeminiVisionService()
 
     async def _get_expert(self, expert_id: str) -> Dict[str, Any]:
         return self.expert_repo.get_by_id(expert_id)
@@ -206,6 +210,70 @@ class InterviewDomain(BaseDomain):
                 "reasoning": copilot_data.get("internal_reasoning", "")
             }
         }
+
+    async def visual_analyze(self, session_id: str, user_id: str, input_type: str, file_bytes: bytes, mime_type: str, file_name: str, file_size: int, context_text: str) -> Dict[str, Any]:
+        """Process visual input upload, run Gemini analysis, and generate next follow-up question."""
+        # 1. Save metadata to DB
+        visual_input_record = self.visual_input_repo.create_visual_input({
+            "session_id": session_id,
+            "user_id": user_id if user_id else None,
+            "input_type": input_type,
+            "file_name": file_name,
+            "file_type": mime_type,
+            "file_size": file_size,
+            "context_text": context_text,
+            "status": "processing"
+        })
+        visual_input_id = visual_input_record["id"]
+
+        # 2. Upload to Storage
+        storage_path = f"{session_id}/{visual_input_id}_{file_name}"
+        self.visual_input_repo.upload_to_storage(storage_path, file_bytes, mime_type)
+        self.visual_input_repo.update_visual_input(visual_input_id, {"storage_path": storage_path})
+
+        try:
+            # 3. Analyze with Gemini
+            if input_type in ["screen_recording", "video"]:
+                analysis_json, raw_response = self.gemini_vision.analyze_video(file_bytes, mime_type, context_text)
+            else:
+                analysis_json, raw_response = self.gemini_vision.analyze_image(file_bytes, mime_type, context_text)
+            
+            # 4. Save analysis to DB
+            analysis_record = self.visual_input_repo.create_visual_analysis({
+                "session_id": session_id,
+                "visual_input_id": visual_input_id,
+                "input_type": input_type,
+                "visual_summary": analysis_json.get("visual_summary", ""),
+                "spoken_or_text_summary": analysis_json.get("spoken_or_text_summary", ""),
+                "timeline_json": analysis_json.get("timeline", []),
+                "visible_elements_json": analysis_json.get("visible_elements", []),
+                "key_observations_json": analysis_json.get("key_observations", []),
+                "missing_context_json": analysis_json.get("missing_context", []),
+                "raw_gemini_response_json": {"raw": raw_response}
+            })
+            
+            self.visual_input_repo.update_visual_input(visual_input_id, {"status": "parsed"})
+            
+            # 5. Generate next follow-up question using the short summary as a synthetic expert answer
+            input_label = "SCREEN RECORDING" if input_type == "screen_recording" else "VIDEO" if input_type == "video" else "IMAGE"
+            synthetic_expert_answer = f"[{input_label} UPLOADED: {file_name}] Context: {context_text}\nAnalysis: {analysis_json.get('short_summary', 'User uploaded a visual input.')}"
+            
+            # Re-use live_turn for the follow-up generation logic
+            # This will append the summary to the transcript and generate a question based on it.
+            live_turn_result = await self.live_turn(session_id, synthetic_expert_answer)
+            
+            return {
+                "success": True,
+                "short_summary": analysis_json.get("short_summary", ""),
+                "first_follow_up_question": live_turn_result.get("question"),
+                "visual_input_id": visual_input_id,
+                "analysis_id": analysis_record["id"]
+            }
+
+        except Exception as e:
+            logger.error(f"Visual analysis failed for {visual_input_id}: {str(e)}")
+            self.visual_input_repo.update_visual_input(visual_input_id, {"status": "failed"})
+            raise HTTPException(status_code=500, detail=str(e))
 
     def _build_conversation_history(self, transcript: str, max_turns: int = 3) -> str:
         """Build a sliding window of the last N HOST+EXPERT turn pairs."""
